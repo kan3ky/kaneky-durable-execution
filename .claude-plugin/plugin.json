@@ -1,0 +1,5 @@
+{
+  "name": "kaneky-durable-execution",
+  "description": "Make work that stops and resumes come back correct — replay caches, step fingerprints, and retry budgets that survive a restart.",
+  "version": "0.1.0"
+}
