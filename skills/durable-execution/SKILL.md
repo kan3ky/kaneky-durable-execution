@@ -301,7 +301,44 @@ it. Return the error, and return an outcome with **no status at all** — the
 journal genuinely does not know what state the step is in, and any of the
 existing statuses would be a claim it cannot support.
 
-## 7. The determinism rule that makes any of this safe
+## 7. Work started by a request must not inherit the request's context
+
+The smallest version of "work that has to survive" is a handler that kicks off a
+job and answers immediately. If the job is started on the **request's** context,
+it dies the moment the response is written — and the failure is disguised, twice
+over.
+
+- **The runtime's own words become a claim about the domain.** The job records
+  `context canceled` and the page renders it beside the thing the job was
+  working on. A read that never happened is reported as a finding about the
+  subject it never reached.
+- **No test with a synthetic request can see it.** In Go, `httptest.NewRequest`
+  carries a background context that nobody cancels, so a handler tested this way
+  passes forever; only a real server cancels the context at the end of the
+  response. The same asymmetry exists wherever a test harness fabricates the
+  request object instead of making one.
+
+Three things follow, and they are cheap:
+
+1. **Detach deliberately** at the point of submission — `context.WithoutCancel`,
+   a job-scoped context, or the worker's own — and give the work a deadline of
+   its own, because "not the request's lifetime" must not mean "no lifetime".
+2. **Cover it with one test over a real listener.** Start the server, post over
+   a real client, let the response complete, then assert the work finished.
+   That single test is the only thing that distinguishes the two contexts.
+3. **Never surface a runtime's cancellation string to a reader.** Translate it:
+   *this run was stopped before it read anything, so it did not happen* — and
+   say explicitly that it implies nothing about the subject. A cancellation is a
+   fact about your process, and a reader cannot be expected to know that.
+
+The general shape, and it is the reason this sits in this skill: **the lifetime
+of the work and the lifetime of the thing that asked for it are different, and
+every layer that conflates them fails silently.** The same conflation appears
+as a connection pool closed while a background flush is in flight, a shutdown
+that cancels in-flight jobs it should have drained, and a cache entry tied to a
+session that outlives it.
+
+## 8. The determinism rule that makes any of this safe
 
 Code *between* steps runs again on every replay. So anything non-deterministic
 — the clock, randomness, a network call, a UUID — must happen **inside** a
@@ -370,6 +407,79 @@ those two lists is the defect.
 11. **Make the journal read fail** and confirm the step does not execute.
 12. **Ask a completed resume which steps it executed.** If it cannot answer,
     its success report means less than it appears to.
+
+## A dial that moved has to reach the loop already waiting on the old one
+
+A long-running loop usually looks like: do the work, compute the wait, sleep,
+repeat. The wait is read once, when the sleep begins. That is the bug, and it
+does not look like one:
+
+```
+for {
+    cycle()
+    wait := config.Interval()   // read ONCE
+    time.Sleep(wait)            // and honoured for its whole duration
+}
+```
+
+Shorten the interval from two minutes to twenty seconds and nothing happens for
+up to two minutes. The setting is applied — a later read returns the new value,
+the change is recorded, the UI shows it — and the running process keeps the old
+schedule anyway, because it is asleep on a timer that was created before anyone
+touched the dial.
+
+**Why it survives review.** Everything about it is correct in isolation. The
+store took the write. The loop reads the current config *each iteration*. Nobody
+wrote `interval := 2 * time.Minute` anywhere. The defect lives entirely in the
+gap between "the next iteration reads it" and "an iteration can last as long as
+the old value".
+
+**How it surfaced, and why that is worse than it sounds.** A liveness check that
+compares "time since last cycle" against "the configured interval" will start
+reporting the process as LATE the moment the interval is shortened — correctly,
+by its own definition, because the process genuinely is past its new deadline.
+So the first symptom is a health indicator accusing a healthy process, and the
+tempting fix is to loosen the detector. Loosening it removes the only thing that
+noticed.
+
+**The fix is to make the sleep interruptible, and to recompute against the
+current value each time it wakes:**
+
+```
+for {
+    cycle()
+    last := now()
+    for {
+        wait := config.Interval()        // re-read on EVERY wake
+        remaining := last.Add(wait).Sub(now())
+        if remaining <= 0 { break }      // already due under the new value
+        select {
+        case <-ctx.Done():  return
+        case <-changed:                  // a dial moved; recompute
+        case <-time.After(remaining):
+        }
+        if now().Sub(last) >= wait { break }
+    }
+}
+```
+
+Two properties worth keeping: the deadline is measured from the LAST CYCLE
+rather than from the moment of the change, so shortening an interval does not
+grant a free extra run and lengthening one does not cost a cycle; and the wake
+channel is buffered to one with a non-blocking send, because what the loop does
+on waking is read the current configuration, so one pending wake is worth
+exactly as much as three.
+
+**Where else the same shape appears:** a poll interval, a retry backoff ceiling,
+a lease renewal period, a batch window, a rate limit, a cache TTL held in a
+sleeping refresher. Anything where a duration is read once and then honoured for
+its own length.
+
+**The test that catches it.** Not "does the setting take effect" — it does.
+Start the loop on a long interval, wait for one cycle, shorten the interval,
+then assert the NEXT DEADLINE moved, without waiting for the old one to expire.
+Assert the other direction too: lengthening must not cost a cycle. A test that
+only checks the value after the sleep will pass against the broken version.
 
 ## Adjacent skills
 
